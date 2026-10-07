@@ -1,0 +1,209 @@
+import asyncio
+import contextvars
+from types import SimpleNamespace
+from typing import Any, Literal, cast
+from unittest.mock import AsyncMock
+
+import pytest
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage
+
+from agent.thread_title import (
+    _ThreadTitle,
+    generate_and_store_thread_title,
+    schedule_thread_title_generation,
+)
+
+# Stands in for LangGraph's stream writer, which travels in a contextvar. A title
+# call that sees a non-default value here is running inside the agent run, and
+# would stream its tokens into the thread the user is watching.
+_RUN_STREAM: contextvars.ContextVar[str] = contextvars.ContextVar("run_stream", default="none")
+
+
+class _StructuredModel:
+    def __init__(self, recorder: dict[str, Any] | None = None) -> None:
+        self._recorder = recorder if recorder is not None else {}
+
+    async def ainvoke(self, messages: list[Any], config: Any = None, **_: Any) -> _ThreadTitle:
+        self._recorder["stream"] = _RUN_STREAM.get()
+        self._recorder["config"] = config
+        self._recorder["messages"] = messages
+        return _ThreadTitle(title="Review thread title generation")
+
+
+class _Model:
+    def __init__(self, recorder: dict[str, Any] | None = None) -> None:
+        self._recorder = recorder if recorder is not None else {}
+
+    def with_structured_output(self, schema: type[_ThreadTitle]) -> _StructuredModel:
+        assert schema is _ThreadTitle
+        return _StructuredModel(self._recorder)
+
+
+class _Threads:
+    def __init__(self, metadata: dict[str, Any]) -> None:
+        self.metadata = metadata
+
+    async def get(self, *, thread_id: str) -> dict[str, Any]:
+        assert thread_id == "thread-123"
+        return {"metadata": dict(self.metadata)}
+
+    async def update(self, *, thread_id: str, metadata: dict[str, Any]) -> None:
+        assert thread_id == "thread-123"
+        self.metadata.update(metadata)
+
+
+@pytest.mark.parametrize(
+    ("metadata", "expected"),
+    [
+        (
+            {
+                "source": "slack",
+                "title": "please review title generation",
+                "title_seed": "please review title generation",
+            },
+            {
+                "source": "slack",
+                "title": "Review thread title generation",
+                "title_seed": None,
+            },
+        ),
+        (
+            {"source": "github", "title": "PR #1947", "title_seed": "PR #1947"},
+            {"source": "github", "title": "PR #1947", "title_seed": "PR #1947"},
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_generate_and_store_thread_title_only_replaces_explicit_seed(
+    metadata: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    threads = _Threads(dict(metadata))
+    client = type("Client", (), {"threads": threads})()
+
+    await generate_and_store_thread_title(
+        thread_id="thread-123",
+        conversation="please review title generation",
+        model=cast(BaseChatModel, _Model()),
+        client=client,
+    )
+
+    assert threads.metadata == expected
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout"])
+async def test_title_persistence_failure_is_bounded_and_logged(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: Literal["error", "timeout"],
+) -> None:
+    threads = _Threads({"source": "dashboard", "title": "Fix the bug", "title_seed": "Fix the bug"})
+    cancelled = asyncio.Event()
+
+    async def fail_update(*, thread_id: str, metadata: dict[str, object]) -> None:
+        if failure == "error":
+            raise OSError("Title storage unavailable")
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(threads, "update", fail_update)
+    monkeypatch.setattr("agent.thread_title.TITLE_GENERATION_TIMEOUT_SECONDS", 0.01)
+    await asyncio.wait_for(
+        generate_and_store_thread_title(
+            thread_id="thread-123",
+            conversation="Fix the bug",
+            model=cast(BaseChatModel, _Model()),
+            client=SimpleNamespace(threads=threads),
+        ),
+        timeout=1,
+    )
+
+    assert threads.metadata["title"] == "Fix the bug"
+    assert threads.metadata["title_seed"] == "Fix the bug"
+    assert cancelled.is_set() is (failure == "timeout")
+    record = next(r for r in caplog.records if r.message == "Thread title persistence failed")
+    assert record.__dict__["thread_id"] == "thread-123"
+    assert record.exc_info is not None
+    assert isinstance(record.exc_info[1], TimeoutError if failure == "timeout" else OSError)
+
+
+class _PromotingThreads(_Threads):
+    """Threads whose update promotes the thread into a code channel mid-flight."""
+
+    async def update(self, *, thread_id: str, metadata: dict[str, Any]) -> None:
+        await super().update(thread_id=thread_id, metadata=metadata)
+        self.metadata["source"] = "slack"
+        self.metadata["source_context"] = {
+            "slack_thread": {"channel_id": "C-code", "thread_ts": "0"}
+        }
+
+
+@pytest.mark.asyncio
+async def test_title_generation_renames_channel_promoted_during_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A promotion racing the title update must still rename the channel.
+
+    The pre-update metadata snapshot does not carry a Slack location, so the
+    rename decision has to come from a re-read after the update.
+    """
+    threads = _PromotingThreads(
+        {
+            "source": "dashboard",
+            "title": "please review title generation",
+            "title_seed": "please review title generation",
+        }
+    )
+    client = type("Client", (), {"threads": threads})()
+    rename = AsyncMock(return_value=(True, None))
+    monkeypatch.setattr("agent.thread_title.rename_session", rename)
+    monkeypatch.setattr("agent.thread_title.is_code_channel", AsyncMock(return_value=True))
+
+    await generate_and_store_thread_title(
+        thread_id="thread-123",
+        conversation="please review title generation",
+        model=cast(BaseChatModel, _Model()),
+        client=client,
+    )
+
+    rename.assert_awaited_once_with("C-code", "Review thread title generation")
+
+
+@pytest.mark.asyncio
+async def test_title_generation_never_inherits_the_runs_context() -> None:
+    """The background task must not run inside the caller's context.
+
+    An inherited context carries the run's stream writer, so the structured
+    output is emitted into the run's message stream: it renders as a bogus
+    `{"title": ...}` assistant message and derails the client's assembly of every
+    chunk after it, freezing the transcript until the page is reloaded.
+    """
+    recorder: dict[str, Any] = {}
+    threads = _Threads(
+        {
+            "source": "dashboard",
+            "title": "please review title generation",
+            "title_seed": "please review title generation",
+        }
+    )
+    client = type("Client", (), {"threads": threads})()
+
+    token = _RUN_STREAM.set("agent-run-stream")
+    try:
+        schedule_thread_title_generation(
+            thread_id="thread-123",
+            messages=[HumanMessage(content="please review title generation")],
+            model=cast(BaseChatModel, _Model(recorder)),
+            client=client,
+        )
+        for _ in range(50):
+            await asyncio.sleep(0)
+            if "stream" in recorder:
+                break
+    finally:
+        _RUN_STREAM.reset(token)
+
+    assert recorder["stream"] == "none"
+    assert threads.metadata["title"] == "Review thread title generation"

@@ -1,0 +1,127 @@
+{
+  "name": "open-swe-desktop",
+  "version": "0.2.13",
+  "private": true,
+  "description": "Experimental Open SWE desktop client",
+  "main": "build/main.cjs",
+  "scripts": {
+    "build": "node scripts/build-main.cjs",
+    "build:ui": "pnpm --filter open-swe-dashboard run build",
+    "dev": "pnpm run build:ui && pnpm run build && electron . --dev",
+    "start": "pnpm run build:ui && pnpm run build && electron .",
+    "test:run": "node --test test/*.test.cjs",
+    "test": "pnpm run build && pnpm run test:run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "check": "pnpm run typecheck && pnpm run test && pnpm run build:ui",
+    "pack": "pnpm run build:ui && pnpm run build && pnpm run build:local-backend && pnpm run build:cli && electron-builder --dir",
+    "dist": "pnpm run build:ui && pnpm run build && pnpm run build:local-backend && pnpm run build:cli && electron-builder",
+    "build:local-backend": "node scripts/build-local-backend.cjs",
+    "build:cli": "pnpm --filter open-swe-cli run build"
+  },
+  "build": {
+    "appId": "com.langchain.openswe",
+    "productName": "Open SWE",
+    "publish": {
+      "provider": "github",
+      "owner": "langchain-ai",
+      "repo": "open-swe"
+    },
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/node-pty/**/*"
+    ],
+    "afterSign": "build/notarize.cjs",
+    "npmRebuild": true,
+    "icon": "resources/icon.png",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "build/**/*",
+      "src/setup.html",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "resources/app-update.yml",
+        "to": "app-update.yml"
+      },
+      {
+        "from": "resources/icon.png",
+        "to": "icon.png"
+      },
+      {
+        "from": "../ui/.output/public",
+        "to": "ui",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../ui/src/features/agents/terminal/ghostty",
+        "to": "ui/licenses/ghostty",
+        "filter": [
+          "T3-LICENSE",
+          "fonts/LICENSE"
+        ]
+      },
+      {
+        "from": "../ui/native/libghostty-vt/LICENSE",
+        "to": "ui/licenses/libghostty-vt.LICENSE"
+      },
+      {
+        "from": "resources/local-backend",
+        "to": "local-backend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../cli/dist/oswe",
+        "to": "bin/oswe"
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "artifactName": "Open-SWE-${version}-${arch}-mac.${ext}",
+      "icon": "resources/icon.icns",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "entitlements.mac.plist",
+      "extendInfo": { "NSUserActivityTypes": ["NSUserActivityTypeBrowsingWeb"] },
+      "entitlementsInherit": "entitlements.mac.inherit.plist",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "dmg": {
+      "size": "2g"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ]
+    },
+    "linux": {
+      "category": "Development",
+      "target": [
+        "AppImage"
+      ]
+    }
+  },
+  "author": "LangChain",
+  "license": "MIT",
+  "homepage": "https://github.com/langchain-ai/open-swe",
+  "devDependencies": {
+    "@electron/notarize": "3.1.1",
+    "@types/node": "26.6.3",
+    "electron": "44.4.5",
+    "electron-builder": "26.15.3",
+    "typescript": "7.0.2"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.9",
+    "node-pty": "1.1.0"
+  }
+}
